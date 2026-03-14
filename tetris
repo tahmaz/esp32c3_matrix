@@ -1,0 +1,252 @@
+// ==================== FIXED AUTO TETRIS (starts immediately, no black screen, better AI) ====================
+
+#include <Adafruit_NeoPixel.h>
+
+#define PIN 1
+#define W 16
+#define H 16
+#define NUM (W * H)
+
+Adafruit_NeoPixel pixels(NUM, PIN, NEO_GRB + NEO_KHZ800);
+
+uint8_t board[H][W];          // 0 empty, 1-7 locked piece
+uint8_t tempBoard[H][W];      // for AI simulation
+
+int currentPiece;
+int currentRot = 0;
+int currentX;
+int currentY;
+
+int targetRot = 0;
+int targetX = 0;
+
+unsigned long lastDrop = 0;
+const unsigned long dropInterval = 250;  // faster, more dynamic
+
+uint32_t colors[7] = {
+  pixels.Color(0, 255, 255),   // I cyan
+  pixels.Color(255, 255, 0),   // O yellow
+  pixels.Color(180, 0, 180),   // T purple
+  pixels.Color(0, 255, 0),     // S green
+  pixels.Color(255, 0, 0),     // Z red
+  pixels.Color(0, 0, 255),     // J blue
+  pixels.Color(255, 140, 0)    // L orange
+};
+
+const int8_t tetrominoes[7][4][4][2] = {
+  { {{0,0},{1,0},{2,0},{3,0}}, {{0,0},{0,1},{0,2},{0,3}}, {{0,0},{1,0},{2,0},{3,0}}, {{0,0},{0,1},{0,2},{0,3}} },
+  { {{0,0},{1,0},{0,1},{1,1}}, {{0,0},{1,0},{0,1},{1,1}}, {{0,0},{1,0},{0,1},{1,1}}, {{0,0},{1,0},{0,1},{1,1}} },
+  { {{-1,0},{0,0},{1,0},{0,1}}, {{0,-1},{0,0},{1,0},{0,1}}, {{-1,1},{0,1},{1,1},{0,0}}, {{-1,0},{0,-1},{0,0},{0,1}} },
+  { {{0,0},{1,0},{-1,1},{0,1}}, {{0,0},{0,1},{1,1},{1,2}}, {{0,1},{1,1},{-1,0},{0,0}}, {{-1,0},{-1,1},{0,1},{0,2}} },
+  { {{-1,0},{0,0},{0,1},{1,1}}, {{1,0},{0,1},{1,1},{0,2}}, {{-1,1},{0,1},{0,2},{1,2}}, {{0,0},{-1,1},{0,1},{-1,2}} },
+  { {{-1,0},{0,0},{1,0},{-1,1}}, {{0,0},{0,1},{0,2},{-1,0}}, {{1,0},{-1,1},{0,1},{1,1}}, {{1,0},{1,1},{1,2},{0,2}} },
+  { {{-1,0},{0,0},{1,0},{1,1}}, {{1,0},{0,1},{0,2},{0,0}}, {{-1,0},{-1,1},{0,1},{1,1}}, {{-1,2},{0,0},{0,1},{0,2}} }
+};
+
+void setup() {
+  pixels.begin();
+  pixels.setBrightness(25);
+  pixels.clear();
+  pixels.show();
+
+  randomSeed(analogRead(0));
+  memset(board, 0, sizeof(board));
+
+  spawnPiece();
+  computeBestPlacement();  // immediate AI decision
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // Gentle rotate toward target (clockwise only)
+  if (currentRot != targetRot) {
+    int oldRot = currentRot;
+    currentRot = (currentRot + 1) % 4;
+    if (collides()) currentRot = oldRot;
+  }
+
+  // Move sideways toward target
+  if (currentX < targetX) {
+    currentX++;
+    if (collides()) currentX--;
+  } else if (currentX > targetX) {
+    currentX--;
+    if (collides()) currentX++;
+  }
+
+  // Auto drop
+  if (now - lastDrop >= dropInterval) {
+    lastDrop = now;
+    currentY++;
+    if (collides()) {
+      currentY--;
+      lockPiece();
+      clearLines();
+      spawnPiece();
+      computeBestPlacement();  // plan next piece immediately
+    }
+  }
+
+  draw();
+  pixels.show();
+  delay(30);
+}
+
+bool collides() {
+  for (int i = 0; i < 4; i++) {
+    int bx = currentX + tetrominoes[currentPiece][currentRot][i][0];
+    int by = currentY + tetrominoes[currentPiece][currentRot][i][1];
+    if (bx < 0 || bx >= W || by >= H) return true;
+    if (by >= 0 && board[by][bx] != 0) return true;
+  }
+  return false;
+}
+
+void lockPiece() {
+  for (int i = 0; i < 4; i++) {
+    int bx = currentX + tetrominoes[currentPiece][currentRot][i][0];
+    int by = currentY + tetrominoes[currentPiece][currentRot][i][1];
+    if (by >= 0 && bx >= 0 && bx < W) board[by][bx] = currentPiece + 1;
+  }
+}
+
+void clearLines() {
+  for (int y = H - 1; y >= 0; y--) {
+    bool full = true;
+    for (int x = 0; x < W; x++) if (board[y][x] == 0) full = false;
+    if (full) {
+      for (int yy = y; yy > 0; yy--) memcpy(board[yy], board[yy - 1], W);
+      memset(board[0], 0, W);
+      y++;  // recheck current line
+    }
+  }
+}
+
+void spawnPiece() {
+  currentPiece = random(7);
+  currentRot = 0;
+  currentX = W / 2 - 1;
+  currentY = 0;  // start visible immediately at top
+
+  if (collides()) {
+    memset(board, 0, sizeof(board));  // game over → restart
+    delay(600);                       // short pause + visual clear
+  }
+}
+
+void computeBestPlacement() {
+  int bestScore = -999999;
+  int bestRot = 0;
+  int bestX = currentX;
+
+  for (int rot = 0; rot < 4; rot++) {
+    for (int testX = 0; testX < W; testX++) {
+      // simulate full drop
+      int dropY = 0;
+      while (true) {
+        bool canDrop = true;
+        for (int i = 0; i < 4; i++) {
+          int bx = testX + tetrominoes[currentPiece][rot][i][0];
+          int by = dropY + 1 + tetrominoes[currentPiece][rot][i][1];
+          if (bx < 0 || bx >= W || by >= H || (by >= 0 && board[by][bx] != 0)) {
+            canDrop = false;
+            break;
+          }
+        }
+        if (!canDrop) break;
+        dropY++;
+      }
+
+      // check final placement validity
+      bool valid = true;
+      for (int i = 0; i < 4; i++) {
+        int bx = testX + tetrominoes[currentPiece][rot][i][0];
+        int by = dropY + tetrominoes[currentPiece][rot][i][1];
+        if (bx < 0 || bx >= W || by >= H || (by >= 0 && board[by][bx] != 0)) {
+          valid = false;
+          break;
+        }
+      }
+      if (!valid) continue;
+
+      // copy + lock + clear lines
+      memcpy(tempBoard, board, sizeof(board));
+      for (int i = 0; i < 4; i++) {
+        int bx = testX + tetrominoes[currentPiece][rot][i][0];
+        int by = dropY + tetrominoes[currentPiece][rot][i][1];
+        if (by >= 0) tempBoard[by][bx] = currentPiece + 1;
+      }
+
+      int cleared = 0;
+      for (int y = H - 1; y >= 0; y--) {
+        bool full = true;
+        for (int x = 0; x < W; x++) if (tempBoard[y][x] == 0) full = false;
+        if (full) {
+          cleared++;
+          for (int yy = y; yy > 0; yy--) memcpy(tempBoard[yy], tempBoard[yy - 1], W);
+          memset(tempBoard[0], 0, W);
+          y++;
+        }
+      }
+
+      // metrics
+      int aggHeight = 0, holes = 0, bumpiness = 0;
+      int heights[W] = {0};
+      for (int x = 0; x < W; x++) {
+        for (int y = 0; y < H; y++) {
+          if (tempBoard[y][x] != 0) {
+            heights[x] = H - y;
+            break;
+          }
+        }
+        aggHeight += heights[x];
+
+        bool seen = false;
+        for (int y = 0; y < H; y++) {
+          if (tempBoard[y][x] != 0) seen = true;
+          else if (seen) holes++;
+        }
+      }
+      for (int x = 0; x < W - 1; x++) bumpiness += abs(heights[x] - heights[x + 1]);
+
+      int score = cleared * 1000 - aggHeight * 50 - holes * 200 - bumpiness * 30;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestRot = rot;
+        bestX = testX;
+      }
+    }
+  }
+
+  targetRot = bestRot;
+  targetX = bestX;
+}
+
+void draw() {
+  pixels.clear();
+
+  // locked pieces
+  for (int y = 0; y < H; y++) {
+    for (int x = 0; x < W; x++) {
+      if (board[y][x] > 0) {
+        pixels.setPixelColor(xy2idx(x, y), colors[board[y][x] - 1]);
+      }
+    }
+  }
+
+  // current falling piece
+  for (int i = 0; i < 4; i++) {
+    int bx = currentX + tetrominoes[currentPiece][currentRot][i][0];
+    int by = currentY + tetrominoes[currentPiece][currentRot][i][1];
+    if (by >= 0 && bx >= 0 && bx < W) {
+      pixels.setPixelColor(xy2idx(bx, by), colors[currentPiece]);
+    }
+  }
+}
+
+uint16_t xy2idx(uint8_t x, uint8_t y) {
+  if (y & 1) return y * W + (W - 1 - x);
+  return y * W + x;
+}
