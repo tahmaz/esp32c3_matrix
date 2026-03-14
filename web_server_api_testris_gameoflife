@@ -211,7 +211,7 @@ void draw() {
 // ==================== SETUP ====================
 void setup() {
   pixels.begin();
-  pixels.setBrightness(25);
+  pixels.setBrightness(10);
   pixels.clear();
   pixels.show();
 
