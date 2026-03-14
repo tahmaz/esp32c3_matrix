@@ -36,20 +36,23 @@ print("Image sent!")
 
 # Python code for send clock to matrix
 ```python
-# ==================== ESP32-C3 16x16 CLOCK (UDP) ====================
-# Sends a live digital clock (HH:MM) every second via UDP
-# Works perfectly with the matrix code I gave you (serpentine/zigzag order)
-# Zero extra libraries needed!
+# ==================== ESP32-C3 16x16 LIVE CLOCK (UDP) ====================
+# • HH : MM  on top (3 +1 +3 +1 + : +1 +3 +1 +3)
+# • SS       on bottom
+# • One random bright color changes EVERY SECOND
+# • Vertical: 2 empty + 5 font + 2 empty + 5 font + 2 empty
+# • Sends every second
 
 import socket
 import time
 from datetime import datetime
+import random
 
 # ==================== CHANGE THIS ====================
-ESP_IP = "192.168.1.XXX"   # ←←← PUT YOUR ESP32 IP HERE (from Serial Monitor)
+ESP_IP = "192.168.1.XXX"   # ←← YOUR ESP32 IP
 UDP_PORT = 4210
 
-# ==================== 3x5 FONT (digits 0-9) ====================
+# ==================== 3x5 FONT ====================
 FONT = {
     '0': [0b111, 0b101, 0b101, 0b101, 0b111],
     '1': [0b010, 0b110, 0b010, 0b010, 0b111],
@@ -63,48 +66,54 @@ FONT = {
     '9': [0b111, 0b101, 0b111, 0b001, 0b111],
 }
 
-def draw_digit(pixels, char, x_off, y_off, color):
+def draw_digit(grid, char, x_off, y_off, color):
     if char not in FONT:
         return
     pattern = FONT[char]
     for dy in range(5):
         row = pattern[dy]
         for dx in range(3):
-            if row & (1 << (2 - dx)):          # leftmost bit is highest
-                pixels[y_off + dy][x_off + dx] = color
+            if row & (1 << (2 - dx)):
+                if 0 <= y_off + dy < 16 and 0 <= x_off + dx < 16:
+                    grid[y_off + dy][x_off + dx] = color
 
-def draw_colon(pixels, x, y_off, color):
-    pixels[y_off + 1][x] = color
-    pixels[y_off + 3][x] = color
+def draw_colon(grid, x, y_off, color):
+    if 0 <= y_off + 1 < 16:
+        grid[y_off + 1][x] = color
+    if 0 <= y_off + 3 < 16:
+        grid[y_off + 3][x] = color
 
-def create_clock_image():
-    # 16x16 grid (y, x) - black background
-    pixels = [[(0, 0, 0) for _ in range(16)] for _ in range(16)]
+def create_clock_image(color):
+    grid = [[(0, 0, 0) for _ in range(16)] for _ in range(16)]
 
     now = datetime.now()
-    hour_str = f"{now.hour:02d}"
-    min_str = f"{now.minute:02d}"
+    h1, h2 = f"{now.hour:02d}"
+    m1, m2 = f"{now.minute:02d}"
+    s1, s2 = f"{now.second:02d}"
 
-    color = (0, 255, 220)   # nice bright cyan (feels premium on LEDs)
+    # Top part: HH : MM   starting at row 2
+    y_top = 2
+    draw_digit(grid, h1, 0,  y_top, color)     # 0-2
+    draw_digit(grid, h2, 4,  y_top, color)     # 4-6   (1 space gap)
+    draw_colon(grid, 8, y_top, color)          # colon at x=8
+    draw_digit(grid, m1,9, y_top, color)      # 10-12
+    draw_digit(grid, m2,13, y_top, color)      # 14-16 (fits exactly)
 
-    y_off = 5               # centered vertically
+    # Bottom part: SS     starting at row 2+5+2 = 9
+    y_bottom = 9
+    # Center SS roughly (total width 3+1+3 = 7 → start at x=4 or 5)
+    draw_digit(grid, s1, 5,  y_bottom, color)  # 5-7
+    draw_digit(grid, s2, 9,  y_bottom, color)  # 9-11  (nice spacing)
 
-    # Positions that perfectly fit 16x16:
-    draw_digit(pixels, hour_str[0], 0,  y_off, color)   # HH tens
-    draw_digit(pixels, hour_str[1], 4,  y_off, color)   # HH units
-    draw_colon(pixels, 8, y_off, color)
-    draw_digit(pixels, min_str[0], 10, y_off, color)    # MM tens
-    draw_digit(pixels, min_str[1], 13, y_off, color)    # MM units (fits exactly 13-15)
+    # Mirror flip (horizontal) to correct zigzag matrix orientation
+    mirrored = [[grid[y][15 - x] for x in range(16)] for y in range(16)]
 
-    # Convert to UDP byte stream (exact serpentine order your matrix uses)
+    # Convert to UDP byte stream (serpentine/zigzag order)
     data = bytearray()
     for y in range(16):
-        if y % 2 == 0:
-            xs = range(16)                  # even row: left → right
-        else:
-            xs = range(15, -1, -1)          # odd row: right → left
+        xs = range(16) if y % 2 == 0 else range(15, -1, -1)
         for x in xs:
-            r, g, b = pixels[y][x]
+            r, g, b = mirrored[y][x]
             data.extend([r, g, b])
 
     return data
@@ -113,18 +122,24 @@ def create_clock_image():
 # ==================== MAIN LOOP ====================
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-print("🚀 Clock sender started! (Ctrl+C to stop)")
-print(f"Sending to {ESP_IP}:{UDP_PORT} every second")
+print("🚀 CLOCK HH:MM top / SS bottom - color changes EVERY SECOND")
+print(f"Sending to {ESP_IP}:{UDP_PORT}")
 
 try:
     while True:
-        data = create_clock_image()
+        # New random bright color every second
+        r = random.randint(120, 255)
+        g = random.randint(120, 255)
+        b = random.randint(120, 255)
+        color = (r, g, b)
+
+        data = create_clock_image(color)
         s.sendto(data, (ESP_IP, UDP_PORT))
-        
-        current_time = datetime.now().strftime("%H:%M:%S")
-        print(f"Sent → {current_time}  (switch to CUSTOM mode on ESP if needed)")
-        
-        time.sleep(1)          # update every second
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"Sent {now_str}  RGB={color}")
+
+        time.sleep(1.0)
 except KeyboardInterrupt:
-    print("\n🛑 Clock sender stopped.")
+    print("\n🛑 Stopped.")
 ```
