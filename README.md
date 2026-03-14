@@ -15,7 +15,7 @@ curl http://ESP-IP/api/mode?set=gameoflife
 curl http://ESP-IP/api/mode?set=tetris     # back to tetris
 
 
-
+# Python code for send custom images
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
