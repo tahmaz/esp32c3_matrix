@@ -1,0 +1,320 @@
+// ==================== COMPLETE TETRIS + GAME OF LIFE + CUSTOM + WEB/UDP (ESP32-C3) ====================
+// Copy this ENTIRE code into a new Arduino sketch. No missing functions!
+
+#include <Adafruit_NeoPixel.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <WiFiUdp.h>
+
+// ==================== WIFI (CHANGE THESE) ====================
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// ==================== UDP ====================
+const uint16_t UDP_PORT = 4210;
+
+// ==================== MATRIX ====================
+#define PIN 1
+#define W 16
+#define H 16
+#define NUM (W * H)
+
+Adafruit_NeoPixel pixels(NUM, PIN, NEO_GRB + NEO_KHZ800);
+
+// ==================== MODES & GLOBALS ====================
+enum DisplayMode { MODE_TETRIS, MODE_CUSTOM, MODE_GAMEOFLIFE };
+DisplayMode currentMode = MODE_TETRIS;
+
+AsyncWebServer server(80);
+WiFiUDP udp;
+
+// TETRIS
+uint8_t board[H][W];
+uint8_t tempBoard[H][W];
+int currentPiece, currentRot = 0, currentX, currentY;
+int targetRot = 0, targetX = 0;
+unsigned long lastDrop = 0;
+const unsigned long dropInterval = 250;
+
+uint32_t colors[7] = {
+  pixels.Color(0,255,255), pixels.Color(255,255,0), pixels.Color(180,0,180),
+  pixels.Color(0,255,0),   pixels.Color(255,0,0),   pixels.Color(0,0,255),
+  pixels.Color(255,140,0)
+};
+
+const int8_t tetrominoes[7][4][4][2] = {
+  {{{0,0},{1,0},{2,0},{3,0}},{{0,0},{0,1},{0,2},{0,3}},{{0,0},{1,0},{2,0},{3,0}},{{0,0},{0,1},{0,2},{0,3}}},
+  {{{0,0},{1,0},{0,1},{1,1}},{{0,0},{1,0},{0,1},{1,1}},{{0,0},{1,0},{0,1},{1,1}},{{0,0},{1,0},{0,1},{1,1}}},
+  {{{-1,0},{0,0},{1,0},{0,1}},{{0,-1},{0,0},{1,0},{0,1}},{{-1,1},{0,1},{1,1},{0,0}},{{-1,0},{0,-1},{0,0},{0,1}}},
+  {{{0,0},{1,0},{-1,1},{0,1}},{{0,0},{0,1},{1,1},{1,2}},{{0,1},{1,1},{-1,0},{0,0}},{{-1,0},{-1,1},{0,1},{0,2}}},
+  {{{-1,0},{0,0},{0,1},{1,1}},{{1,0},{0,1},{1,1},{0,2}},{{-1,1},{0,1},{0,2},{1,2}},{{0,0},{-1,1},{0,1},{-1,2}}},
+  {{{-1,0},{0,0},{1,0},{-1,1}},{{0,0},{0,1},{0,2},{-1,0}},{{1,0},{-1,1},{0,1},{1,1}},{{1,0},{1,1},{1,2},{0,2}}},
+  {{{-1,0},{0,0},{1,0},{1,1}},{{1,0},{0,1},{0,2},{0,0}},{{-1,0},{-1,1},{0,1},{1,1}},{{-1,2},{0,0},{0,1},{0,2}}}
+};
+
+// GAME OF LIFE
+uint8_t gol[H][W];
+uint8_t nextGol[H][W];
+unsigned long lastGolUpdate = 0;
+const unsigned long golInterval = 150;
+
+// CUSTOM
+uint32_t customPixels[NUM];
+
+// ==================== HELPERS ====================
+uint16_t xy2idx(uint8_t x, uint8_t y) {
+  return (y & 1) ? y * W + (W - 1 - x) : y * W + x;
+}
+
+// ==================== TETRIS FUNCTIONS ====================
+bool collides() {
+  for (int i = 0; i < 4; i++) {
+    int bx = currentX + tetrominoes[currentPiece][currentRot][i][0];
+    int by = currentY + tetrominoes[currentPiece][currentRot][i][1];
+    if (bx < 0 || bx >= W || by >= H) return true;
+    if (by >= 0 && board[by][bx] != 0) return true;
+  }
+  return false;
+}
+
+void lockPiece() {
+  for (int i = 0; i < 4; i++) {
+    int bx = currentX + tetrominoes[currentPiece][currentRot][i][0];
+    int by = currentY + tetrominoes[currentPiece][currentRot][i][1];
+    if (by >= 0 && bx >= 0 && bx < W) board[by][bx] = currentPiece + 1;
+  }
+}
+
+void clearLines() {
+  for (int y = H-1; y >= 0; y--) {
+    bool full = true;
+    for (int x = 0; x < W; x++) if (board[y][x] == 0) full = false;
+    if (full) {
+      for (int yy = y; yy > 0; yy--) memcpy(board[yy], board[yy-1], W);
+      memset(board[0], 0, W);
+      y++;
+    }
+  }
+}
+
+void spawnPiece() {
+  currentPiece = random(7);
+  currentRot = 0;
+  currentX = W/2 - 1;
+  currentY = 0;
+  if (collides()) {
+    memset(board, 0, sizeof(board));
+    delay(600);
+  }
+}
+
+void computeBestPlacement() {
+  int bestScore = -999999, bestRot = 0, bestX = currentX;
+  for (int rot = 0; rot < 4; rot++) {
+    for (int testX = 0; testX < W; testX++) {
+      int dropY = 0;
+      while (true) {
+        bool canDrop = true;
+        for (int i = 0; i < 4; i++) {
+          int bx = testX + tetrominoes[currentPiece][rot][i][0];
+          int by = dropY + 1 + tetrominoes[currentPiece][rot][i][1];
+          if (bx < 0 || bx >= W || by >= H || (by >= 0 && board[by][bx] != 0)) { canDrop = false; break; }
+        }
+        if (!canDrop) break;
+        dropY++;
+      }
+      bool valid = true;
+      for (int i = 0; i < 4; i++) {
+        int bx = testX + tetrominoes[currentPiece][rot][i][0];
+        int by = dropY + tetrominoes[currentPiece][rot][i][1];
+        if (bx < 0 || bx >= W || by >= H || (by >= 0 && board[by][bx] != 0)) { valid = false; break; }
+      }
+      if (!valid) continue;
+
+      memcpy(tempBoard, board, sizeof(board));
+      for (int i = 0; i < 4; i++) {
+        int bx = testX + tetrominoes[currentPiece][rot][i][0];
+        int by = dropY + tetrominoes[currentPiece][rot][i][1];
+        if (by >= 0) tempBoard[by][bx] = currentPiece + 1;
+      }
+
+      int cleared = 0;
+      for (int y = H-1; y >= 0; y--) {
+        bool full = true;
+        for (int x = 0; x < W; x++) if (tempBoard[y][x] == 0) full = false;
+        if (full) { cleared++; for (int yy = y; yy > 0; yy--) memcpy(tempBoard[yy], tempBoard[yy-1], W); memset(tempBoard[0], 0, W); y++; }
+      }
+
+      int aggHeight = 0, holes = 0, bumpiness = 0;
+      int heights[W] = {0};
+      for (int x = 0; x < W; x++) {
+        for (int y = 0; y < H; y++) if (tempBoard[y][x] != 0) { heights[x] = H - y; break; }
+        aggHeight += heights[x];
+        bool seen = false;
+        for (int y = 0; y < H; y++) {
+          if (tempBoard[y][x] != 0) seen = true;
+          else if (seen) holes++;
+        }
+      }
+      for (int x = 0; x < W-1; x++) bumpiness += abs(heights[x] - heights[x+1]);
+
+      int score = cleared * 1000 - aggHeight * 50 - holes * 200 - bumpiness * 30;
+      if (score > bestScore) { bestScore = score; bestRot = rot; bestX = testX; }
+    }
+  }
+  targetRot = bestRot;
+  targetX = bestX;
+}
+
+// ==================== GAME OF LIFE FUNCTIONS ====================
+void initGameOfLife() {
+  memset(gol, 0, sizeof(gol));
+  for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) if (random(100) < 25) gol[y][x] = 1;
+}
+
+void updateGameOfLife() {
+  for (int y = 0; y < H; y++) {
+    for (int x = 0; x < W; x++) {
+      int n = 0;
+      for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0) continue;
+        int nx = (x + dx + W) % W;
+        int ny = (y + dy + H) % H;
+        n += gol[ny][nx];
+      }
+      bool live = gol[y][x];
+      nextGol[y][x] = (live && (n==2 || n==3)) || (!live && n==3) ? 1 : 0;
+    }
+  }
+  memcpy(gol, nextGol, sizeof(gol));
+}
+
+// ==================== DRAW ====================
+void draw() {
+  pixels.clear();
+  if (currentMode == MODE_GAMEOFLIFE) {
+    uint32_t live = pixels.Color(0, 255, 100);
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) if (gol[y][x]) pixels.setPixelColor(xy2idx(x, y), live);
+  } else if (currentMode == MODE_CUSTOM) {
+    for (int i = 0; i < NUM; i++) pixels.setPixelColor(i, customPixels[i]);
+  } else { // TETRIS
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) if (board[y][x] > 0) pixels.setPixelColor(xy2idx(x, y), colors[board[y][x]-1]);
+    for (int i = 0; i < 4; i++) {
+      int bx = currentX + tetrominoes[currentPiece][currentRot][i][0];
+      int by = currentY + tetrominoes[currentPiece][currentRot][i][1];
+      if (by >= 0 && bx >= 0 && bx < W) pixels.setPixelColor(xy2idx(bx, by), colors[currentPiece]);
+    }
+  }
+}
+
+// ==================== SETUP ====================
+void setup() {
+  pixels.begin();
+  pixels.setBrightness(25);
+  pixels.clear();
+  pixels.show();
+
+  randomSeed(analogRead(0));
+  memset(board, 0, sizeof(board));
+  spawnPiece();
+  computeBestPlacement();
+
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+
+  udp.begin(UDP_PORT);
+
+  // === WEB PAGE ===
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="UTF-8"><title>ESP32 16x16</title>
+<style>body{font-family:Arial;text-align:center;background:#111;color:#0f0;}button{margin:10px;padding:15px 30px;font-size:18px;}</style>
+</head><body>
+<h1>ESP32-C3 16x16 Matrix</h1>
+<p>IP: <strong>)rawliteral" + WiFi.localIP().toString() + R"rawliteral(</strong> | UDP: )rawliteral" + String(UDP_PORT) + R"rawliteral(</p>
+<button onclick="setMode('tetris')">▶ TETRIS</button>
+<button onclick="setMode('custom')">🖼 CUSTOM</button>
+<button onclick="setMode('gameoflife')">🌿 GAME OF LIFE</button>
+<br><br><h2>Status: <span id="status">...</span></h2>
+<script>
+function setMode(m){fetch('/api/mode?set='+m).then(()=>updateStatus());}
+function updateStatus(){fetch('/api/status').then(r=>r.text()).then(t=>document.getElementById('status').innerText=t.toUpperCase());}
+setInterval(updateStatus,1500); updateStatus();
+</script>
+</body></html>
+)rawliteral";
+    request->send(200, "text/html", html);
+  });
+
+  // === API ===
+  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String s = (currentMode == MODE_TETRIS) ? "tetris" : (currentMode == MODE_CUSTOM ? "custom" : "gameoflife");
+    request->send(200, "text/plain", s);
+  });
+
+  server.on("/api/mode", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("set")) {
+      String m = request->getParam("set")->value();
+      if (m == "tetris") { currentMode = MODE_TETRIS; memset(board,0,sizeof(board)); spawnPiece(); computeBestPlacement(); }
+      else if (m == "custom") currentMode = MODE_CUSTOM;
+      else if (m == "gameoflife") { currentMode = MODE_GAMEOFLIFE; initGameOfLife(); }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/api/brightness", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("val")) pixels.setBrightness(request->getParam("val")->value().toInt());
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.begin();
+  Serial.println("✅ All servers started!");
+}
+
+// ==================== LOOP ====================
+void loop() {
+  unsigned long now = millis();
+
+  // TETRIS
+  if (currentMode == MODE_TETRIS) {
+    if (currentRot != targetRot) { int old = currentRot; currentRot = (currentRot+1)%4; if (collides()) currentRot = old; }
+    if (currentX < targetX) { currentX++; if (collides()) currentX--; }
+    else if (currentX > targetX) { currentX--; if (collides()) currentX++; }
+
+    if (now - lastDrop >= dropInterval) {
+      lastDrop = now; currentY++;
+      if (collides()) { currentY--; lockPiece(); clearLines(); spawnPiece(); computeBestPlacement(); }
+    }
+  }
+
+  // GAME OF LIFE
+  if (currentMode == MODE_GAMEOFLIFE && now - lastGolUpdate >= golInterval) {
+    lastGolUpdate = now;
+    updateGameOfLife();
+  }
+
+  // UDP (images + commands)
+  int packetSize = udp.parsePacket();
+  if (packetSize > 0) {
+    uint8_t buffer[1024];
+    int len = udp.read(buffer, sizeof(buffer));
+    if (len == NUM * 3) {  // raw 16x16 RGB image
+      for (int i = 0; i < NUM; i++) customPixels[i] = pixels.Color(buffer[i*3], buffer[i*3+1], buffer[i*3+2]);
+      currentMode = MODE_CUSTOM;
+      udp.beginPacket(udp.remoteIP(), udp.remotePort()); udp.print("IMAGE_OK"); udp.endPacket();
+    } else if (len > 0 && len < 50) {
+      buffer[len] = 0; String cmd = String((char*)buffer); cmd.trim();
+      if (cmd == "tetris")     { currentMode = MODE_TETRIS; memset(board,0,sizeof(board)); spawnPiece(); computeBestPlacement(); udp.beginPacket(udp.remoteIP(), udp.remotePort()); udp.print("MODE_TETRIS"); udp.endPacket(); }
+      else if (cmd == "custom")     { currentMode = MODE_CUSTOM; udp.beginPacket(udp.remoteIP(), udp.remotePort()); udp.print("MODE_CUSTOM"); udp.endPacket(); }
+      else if (cmd == "gameoflife") { currentMode = MODE_GAMEOFLIFE; initGameOfLife(); udp.beginPacket(udp.remoteIP(), udp.remotePort()); udp.print("MODE_GAMEOFLIFE"); udp.endPacket(); }
+    }
+  }
+
+  draw();
+  pixels.show();
+  delay(30);
+}
