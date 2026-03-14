@@ -126,11 +126,12 @@ print("🚀 CLOCK HH:MM top / SS bottom - color changes EVERY SECOND")
 print(f"Sending to {ESP_IP}:{UDP_PORT}")
 
 try:
+    allowed_values = [5, 55, 105, 155, 205, 255]
     while True:
         # New random bright color every second
-        r = random.randint(120, 255)
-        g = random.randint(120, 255)
-        b = random.randint(120, 255)
+        r = random.choice(allowed_values)
+        g = random.choice(allowed_values)
+        b = random.choice(allowed_values)
         color = (r, g, b)
 
         data = create_clock_image(color)
